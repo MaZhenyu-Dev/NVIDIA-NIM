@@ -6,7 +6,7 @@ API路由层
 """
 
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
@@ -76,7 +76,7 @@ router = APIRouter()
 
 class Message(BaseModel):
     role: str
-    content: str
+    content: Union[str, List[Dict]]
 
 
 class ChatCompletionRequest(BaseModel):
