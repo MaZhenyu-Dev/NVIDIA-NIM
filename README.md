@@ -138,6 +138,22 @@ balancer:
   wait_timeout: 65                  # 无可用 Key 时等待超时（秒）
   max_retries: 3                    # 失败重试次数
 
+  # ── 前置准入控制 (Admission Control) ──────────────────────────────
+  # 防止并发请求超过所有 Key 的总配额，从源头避免 NVIDIA 返回 429 雪崩
+  #
+  # admission_mode: 准入模式
+  #   - "reject_fast": 快速失败模式（推荐高并发场景）
+  #       配额不足时立即返回 HTTP 429，客户端可据此自动重试
+  #       优点：零等待、零资源浪费、防止级联失败
+  #   - "queue_wait": 排队等待模式（推荐交互式/低延迟场景）
+  #       配额不足时智能等待，直到有配额释放或超时
+  #       优点：用户无感知，但会占用协程和连接资源
+  #
+  # queue_wait_timeout: 排队模式下的最大等待秒数（仅 queue_wait 模式生效）
+  #   超时后同样返回 HTTP 429
+  admission_mode: "reject_fast"    # reject_fast | queue_wait
+  queue_wait_timeout: 30          # 单位：秒，推荐 10~60
+
 server:
   port: 8000                        # 服务监听端口
 
