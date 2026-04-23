@@ -51,16 +51,29 @@ class NvidiaProxy:
             timeout=120.0,
         )
 
+    @staticmethod
+    def _estimate_prompt_tokens(messages: List[Dict]) -> int:
+        total_chars = 0
+        for msg in messages:
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                total_chars += len(content)
+            elif isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        total_chars += len(part.get("text", ""))
+        return max(1, int(total_chars / 3.5)) + len(messages) * 4
+
     def _report(
         self,
         model: str,
         key_alias: str,
-        usage,              # openai Usage 对象或 None
+        usage,
         start_time: float,
         success: bool,
         stream: bool = False,
+        estimated_pt: int = 0,
     ):
-        """将Token统计上报给 StatsManager"""
         if self.stats is None:
             return
         latency_ms = int((time.time() - start_time) * 1000)
@@ -69,6 +82,8 @@ class NvidiaProxy:
         if usage:
             prompt_tokens = getattr(usage, "prompt_tokens", 0) or 0
             completion_tokens = getattr(usage, "completion_tokens", 0) or 0
+        elif estimated_pt > 0:
+            prompt_tokens = estimated_pt
         self.stats.record(
             model=model,
             key_alias=key_alias,
@@ -104,6 +119,7 @@ class NvidiaProxy:
             key_obj.record_request()
             client = self._make_client(key_obj.key)
             start_time = time.time()
+            est_pt = self._estimate_prompt_tokens(messages)
 
             stream_prompt_tokens = 0
             stream_completion_tokens = 0
@@ -133,14 +149,14 @@ class NvidiaProxy:
 
             except RateLimitError as e:
                 key_obj.record_rate_limit_error()
-                self._report(model, key_obj.alias, None, start_time, False)
+                self._report(model, key_obj.alias, None, start_time, False, estimated_pt=est_pt)
                 last_exception = e
                 logger.warning(f"[{key_obj.alias}] Rate Limit (429)，切换Key重试...")
                 continue
 
             except APIConnectionError as e:
                 key_obj.record_general_error()
-                self._report(model, key_obj.alias, None, start_time, False)
+                self._report(model, key_obj.alias, None, start_time, False, estimated_pt=est_pt)
                 last_exception = e
                 wait = 2 ** (attempt - 1)
                 logger.warning(f"[{key_obj.alias}] 网络错误，{wait}s 后重试: {e}")
@@ -148,7 +164,7 @@ class NvidiaProxy:
 
             except APIStatusError as e:
                 key_obj.record_general_error()
-                self._report(model, key_obj.alias, None, start_time, False)
+                self._report(model, key_obj.alias, None, start_time, False, estimated_pt=est_pt)
                 last_exception = e
                 if e.status_code >= 500:
                     wait = 2 ** (attempt - 1)
@@ -160,7 +176,7 @@ class NvidiaProxy:
 
             except Exception as e:
                 key_obj.record_general_error()
-                self._report(model, key_obj.alias, None, start_time, False)
+                self._report(model, key_obj.alias, None, start_time, False, estimated_pt=est_pt)
                 logger.error(f"[{key_obj.alias}] 未知错误: {e}")
                 raise
 
@@ -191,6 +207,7 @@ class NvidiaProxy:
             key_obj.record_request()
             client = self._make_client(key_obj.key)
             start_time = time.time()
+            est_pt = self._estimate_prompt_tokens(messages)
 
             stream_prompt_tokens = 0
             stream_completion_tokens = 0
@@ -229,6 +246,8 @@ class NvidiaProxy:
                 if self.stats:
                     if stream_completion_tokens == 0 and stream_content_chars > 0:
                         stream_completion_tokens = max(1, int(stream_content_chars / 3))
+                    if stream_prompt_tokens == 0:
+                        stream_prompt_tokens = est_pt
                     self.stats.record(
                         model=model,
                         key_alias=key_obj.alias,
@@ -242,14 +261,14 @@ class NvidiaProxy:
 
             except RateLimitError as e:
                 key_obj.record_rate_limit_error()
-                self._report(model, key_obj.alias, None, start_time, False, True)
+                self._report(model, key_obj.alias, None, start_time, False, True, estimated_pt=est_pt)
                 last_exception = e
                 logger.warning(f"[{key_obj.alias}] 流式 Rate Limit，切换Key重试...")
                 continue
 
             except APIConnectionError as e:
                 key_obj.record_general_error()
-                self._report(model, key_obj.alias, None, start_time, False, True)
+                self._report(model, key_obj.alias, None, start_time, False, True, estimated_pt=est_pt)
                 last_exception = e
                 wait = 2 ** (attempt - 1)
                 logger.warning(f"[{key_obj.alias}] 流式网络错误，{wait}s 后重试")
@@ -257,7 +276,7 @@ class NvidiaProxy:
 
             except APIStatusError as e:
                 key_obj.record_general_error()
-                self._report(model, key_obj.alias, None, start_time, False, True)
+                self._report(model, key_obj.alias, None, start_time, False, True, estimated_pt=est_pt)
                 last_exception = e
                 if e.status_code >= 500:
                     wait = 2 ** (attempt - 1)
@@ -268,7 +287,7 @@ class NvidiaProxy:
 
             except Exception as e:
                 key_obj.record_general_error()
-                self._report(model, key_obj.alias, None, start_time, False, True)
+                self._report(model, key_obj.alias, None, start_time, False, True, estimated_pt=est_pt)
                 last_exception = e
                 logger.error(f"[{key_obj.alias}] 流式未知错误: {e}")
                 if attempt < self.max_retries:
