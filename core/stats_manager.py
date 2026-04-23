@@ -33,6 +33,8 @@ class RequestRecord:
     stream: bool
     error_type: Optional[str] = None
     error_msg: Optional[str] = None
+    ttft_ms: int = 0
+    tokens_per_second: float = 0.0
 
 
 @dataclass
@@ -67,6 +69,7 @@ class StatsManager:
     WINDOW_MINUTES = 24 * 60
     MAX_RECORDS = 500
     CLEANUP_INTERVAL = 3600
+    PERF_WINDOW_SIZE = 50
 
     def __init__(self, write_buffer=None):
         from core.database import get_engine
@@ -76,7 +79,7 @@ class StatsManager:
         if self._write_buffer:
             self._write_buffer.set_flush_callback(self._flush_to_db)
 
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
 
         self._timeline: Dict[float, TimeSlot] = {}
         self._model_stats: Dict[str, Dict[str, int]] = defaultdict(lambda: {
@@ -97,6 +100,11 @@ class StatsManager:
         self._last_cleanup_time = self._start_time
         self._model_last_seen: Dict[str, float] = {}
         self._key_last_seen: Dict[str, float] = {}
+
+        self._perf_windows: Dict[str, Dict[str, deque]] = defaultdict(lambda: {
+            "ttft_ms": deque(maxlen=self.PERF_WINDOW_SIZE),
+            "tokens_per_second": deque(maxlen=self.PERF_WINDOW_SIZE),
+        })
 
         self._load_from_db()
 
@@ -183,32 +191,39 @@ class StatsManager:
                     conn.execute(text(
                         "INSERT INTO request_logs "
                         "(timestamp, model, key_alias, prompt_tokens, completion_tokens, "
-                        "total_tokens, latency_ms, success, stream, error_type, error_msg) "
-                        "VALUES (:ts, :m, :ka, :pt, :ct, :tt, :lm, :suc, :strm, :et, :em)"
+                        "total_tokens, latency_ms, success, stream, error_type, error_msg, "
+                        "ttft_ms, tokens_per_second) "
+                        "VALUES (:ts, :m, :ka, :pt, :ct, :tt, :lm, :suc, :strm, :et, :em, "
+                        ":ttft, :tps)"
                     ), {
                         "ts": r.timestamp, "m": r.model, "ka": r.key_alias,
                         "pt": r.prompt_tokens, "ct": r.completion_tokens,
                         "tt": r.total_tokens, "lm": r.latency_ms,
                         "suc": success_int, "strm": stream_int,
                         "et": r.error_type, "em": r.error_msg,
+                        "ttft": r.ttft_ms, "tps": r.tokens_per_second,
                     })
 
                     conn.execute(text(
                         "INSERT INTO model_stats "
                         "(model_id, total_requests, total_errors, prompt_tokens, "
-                        "completion_tokens, total_tokens, last_seen_at, first_seen_at) "
-                        "VALUES (:mid, 1, :te, :pt, :ct, :tt, :ls, :fs) "
+                        "completion_tokens, total_tokens, total_latency_ms, "
+                        "latency_count, last_seen_at, first_seen_at) "
+                        "VALUES (:mid, 1, :te, :pt, :ct, :tt, :tlm, 1, :ls, :fs) "
                         "ON CONFLICT(model_id) DO UPDATE SET "
                         "total_requests=total_requests+1, "
                         "total_errors=total_errors+:te, "
                         "prompt_tokens=prompt_tokens+:pt, "
                         "completion_tokens=completion_tokens+:ct, "
                         "total_tokens=total_tokens+:tt, "
+                        "total_latency_ms=total_latency_ms+:tlm, "
+                        "latency_count=latency_count+1, "
                         "last_seen_at=:ls"
                     ), {
                         "mid": r.model, "te": errors_val,
                         "pt": r.prompt_tokens, "ct": r.completion_tokens,
-                        "tt": r.total_tokens, "ls": r.timestamp, "fs": r.timestamp,
+                        "tt": r.total_tokens, "tlm": r.latency_ms,
+                        "ls": r.timestamp, "fs": r.timestamp,
                     })
 
                     conn.execute(text(
@@ -270,6 +285,8 @@ class StatsManager:
         latency_ms: int,
         success: bool = True,
         stream: bool = False,
+        ttft_ms: int = 0,
+        tokens_per_second: float = 0.0,
     ):
         total_tokens = prompt_tokens + completion_tokens
         now = time.time()
@@ -285,6 +302,8 @@ class StatsManager:
             latency_ms=latency_ms,
             success=success,
             stream=stream,
+            ttft_ms=ttft_ms,
+            tokens_per_second=tokens_per_second,
         )
 
         with self._lock:
@@ -309,6 +328,11 @@ class StatsManager:
             ms["total_tokens"] += total_tokens
             if not success:
                 ms["errors"] += 1
+
+            if ttft_ms > 0:
+                self._perf_windows[model]["ttft_ms"].append(ttft_ms)
+            if tokens_per_second > 0:
+                self._perf_windows[model]["tokens_per_second"].append(tokens_per_second)
 
             self._key_last_seen[key_alias] = now
             ks = self._key_stats[key_alias]
@@ -368,6 +392,41 @@ class StatsManager:
     # 查询接口（供 Router 调用）
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _percentile(data: List[float], p: float) -> float:
+        if not data:
+            return 0.0
+        s = sorted(data)
+        k = (len(s) - 1) * p / 100
+        f = math.floor(k)
+        c = math.ceil(k)
+        if f == c:
+            return s[int(k)]
+        return s[int(f)] * (c - k) + s[int(c)] * (k - f)
+
+    def get_model_perf(self, model: str) -> Dict[str, Any]:
+        with self._lock:
+            win = self._perf_windows.get(model)
+            if not win:
+                return {"ttft_p50": 0, "ttft_p95": 0, "tps_p50": 0.0, "tps_p95": 0.0, "samples": 0}
+            ttft_list = list(win["ttft_ms"])
+            tps_list = list(win["tokens_per_second"])
+            samples = max(len(ttft_list), len(tps_list))
+            return {
+                "ttft_p50": int(self._percentile(ttft_list, 50)) if ttft_list else 0,
+                "ttft_p95": int(self._percentile(ttft_list, 95)) if ttft_list else 0,
+                "tps_p50": round(self._percentile(tps_list, 50), 1) if tps_list else 0.0,
+                "tps_p95": round(self._percentile(tps_list, 95), 1) if tps_list else 0.0,
+                "samples": samples,
+            }
+
+    def get_all_model_perf(self) -> Dict[str, Dict[str, Any]]:
+        result = {}
+        with self._lock:
+            for model in list(self._perf_windows.keys()):
+                result[model] = self.get_model_perf(model)
+        return result
+
     def get_timeline(self, minutes: int = 60) -> List[Dict]:
         minutes = min(minutes, self.WINDOW_MINUTES)
         now = time.time()
@@ -388,10 +447,13 @@ class StatsManager:
 
     def get_model_stats(self) -> List[Dict]:
         with self._lock:
-            return [
-                {"model": model, **stats}
-                for model, stats in self._model_stats.items()
-            ]
+            result = []
+            for model, stats in self._model_stats.items():
+                entry = {"model": model, **dict(stats)}
+                perf = self.get_model_perf(model)
+                entry["perf"] = perf
+                result.append(entry)
+            return result
 
     def get_key_stats(self) -> List[Dict]:
         with self._lock:
@@ -434,11 +496,12 @@ class StatsManager:
             with self._engine.connect() as conn:
                 rows = conn.execute(text(
                     "SELECT timestamp, model, key_alias, prompt_tokens, "
-                    "completion_tokens, total_tokens, latency_ms, success, stream "
+                    "completion_tokens, total_tokens, latency_ms, success, stream, "
+                    "ttft_ms, tokens_per_second "
                     "FROM request_logs ORDER BY id DESC LIMIT :limit"
                 ), {"limit": limit}).fetchall()
 
-                return [
+                db_result = [
                     {
                         "time": r[0],
                         "model": r[1],
@@ -449,25 +512,32 @@ class StatsManager:
                         "latency_ms": r[6],
                         "success": bool(r[7]),
                         "stream": bool(r[8]),
+                        "ttft_ms": r[9] if len(r) > 9 else 0,
+                        "tokens_per_second": r[10] if len(r) > 10 else 0.0,
                     }
                     for r in rows
                 ]
+                if db_result:
+                    return db_result
         except Exception as e:
             logger.warning(f"从数据库查询最近记录失败，回退到内存: {e}")
-            with self._lock:
-                records = list(self._records)[-limit:]
-                records.reverse()
-                return [
-                    {
-                        "time": r.timestamp,
-                        "model": r.model,
-                        "key_alias": r.key_alias,
-                        "prompt_tokens": r.prompt_tokens,
-                        "completion_tokens": r.completion_tokens,
-                        "total_tokens": r.total_tokens,
-                        "latency_ms": r.latency_ms,
-                        "success": r.success,
-                        "stream": r.stream,
-                    }
-                    for r in records
-                ]
+
+        with self._lock:
+            records = list(self._records)[-limit:]
+            records.reverse()
+            return [
+                {
+                    "time": r.timestamp,
+                    "model": r.model,
+                    "key_alias": r.key_alias,
+                    "prompt_tokens": r.prompt_tokens,
+                    "completion_tokens": r.completion_tokens,
+                    "total_tokens": r.total_tokens,
+                    "latency_ms": r.latency_ms,
+                    "success": r.success,
+                    "stream": r.stream,
+                    "ttft_ms": r.ttft_ms,
+                    "tokens_per_second": r.tokens_per_second,
+                }
+                for r in records
+            ]

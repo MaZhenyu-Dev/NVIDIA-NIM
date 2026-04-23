@@ -1094,10 +1094,10 @@ tbody tr:hover {
   -webkit-backdrop-filter: blur(25px) saturate(140%);
   border: 1px solid var(--border-glass);
   border-radius: var(--radius-md);
-  padding: 16px 18px;
+  padding: 14px 16px;
   display: flex;
-  align-items: center;
-  justify-content: space-between;
+  flex-direction: column;
+  gap: 8px;
   transition: all 0.4s var(--ease-spring);
   box-shadow: var(--shadow-sm);
   position: relative;
@@ -1142,7 +1142,6 @@ tbody tr:hover {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  max-width: 190px;
   letter-spacing: -0.2px;
   transition: color 0.3s;
 }
@@ -1154,8 +1153,56 @@ tbody tr:hover {
 .model-id{
   font-size: 11px;
   color: var(--text-tertiary);
-  margin-top: 3px;
+  margin-top: 2px;
   word-break: break-all;
+}
+
+.model-card-main{
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.model-card-main .model-info{
+  min-width:0;
+  flex:1;
+}
+
+.model-perf{
+  display: flex;
+  gap: 12px;
+  padding-top: 6px;
+  border-top: 1px solid var(--border-glass);
+}
+
+.perf-item{
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--text-tertiary);
+}
+
+.perf-icon{
+  font-size: 12px;
+  flex-shrink: 0;
+}
+
+.perf-val{
+  font-family: 'SF Mono', 'Courier New', monospace;
+  font-weight: 600;
+  font-size: 11px;
+}
+
+.perf-val.good{color:var(--green)}
+.perf-val.warn{color:var(--yellow)}
+.perf-val.bad{color:var(--red)}
+
+.perf-unit{
+  font-size: 10px;
+  color: var(--text-tertiary);
+  margin-left: 1px;
 }
 
 /* ===================== 时间轴筛选 ===================== */
@@ -1725,6 +1772,7 @@ let currentTimeRange = 60;
 let modelChartMode = 'requests';
 let allModelsData = [];
 let modelFilter = 'all';
+let modelPerfData = {};
 
 // 颜色方案
 const COLORS = ['#7dd93a','#00e5b8','#5b9aff','#b89fff','#ffb84d','#ff6b6b','#ec4899','#06b6d4','#10b981','#f97316'];
@@ -2005,12 +2053,21 @@ function renderModelPie(data){
   const pieData = data
     .filter(d=>d[key]>0)
     .sort((a,b)=>b[key]-a[key])
-    .map((d,i)=>({
-      name: d.model.includes('/')?d.model.split('/')[1]:d.model,
-      fullName: d.model,
-      value: d[key],
-      itemStyle:{color:COLORS[i%COLORS.length]},
-    }));
+    .map((d,i)=>{
+      const perf=d.perf||{};
+      return {
+        name: d.model.includes('/')?d.model.split('/')[1]:d.model,
+        fullName: d.model,
+        value: d[key],
+        itemStyle:{color:COLORS[i%COLORS.length]},
+        ttftP50: perf.ttft_p50||0,
+        tpsP50: perf.tps_p50||0,
+        samples: perf.samples||0,
+      };
+    });
+
+  const fmtTTFT=v=>v>0?`${v}ms`:'-';
+  const fmtTPS=v=>v>0?`${v}t/s`:'-';
 
   const opt = {
     backgroundColor:'transparent',
@@ -2020,15 +2077,26 @@ function renderModelPie(data){
       borderColor:'rgba(255,255,255,0.1)',borderWidth:1,
       textStyle:{color:'#ffffff',fontSize:12},
       formatter(p){
-        return `<div style="font-size:11px;color:rgba(255,255,255,0.6);margin-bottom:4px">${p.data.fullName}</div>
-          <div><span style="color:${p.color};display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px;box-shadow:0 0 8px ${p.color}">●</span> ${label}: <strong>${fmtNum(p.value)}</strong> (${p.percent}%)</div>`;
+        const d=p.data;
+        let html=`<div style="font-size:11px;color:rgba(255,255,255,0.6);margin-bottom:4px">${d.fullName}</div>
+          <div><span style="color:${p.color};display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px;box-shadow:0 0 8px ${p.color}">●</span> ${label}: <strong>${fmtNum(d.value)}</strong> (${p.percent}%)</div>`;
+        if(d.samples>0){
+          const tc=d.ttftP50<=200?'#7dd93a':d.ttftP50<=500?'#ffb84d':'#ff6b6b';
+          const sc=d.tpsP50>=30?'#7dd93a':d.tpsP50>=10?'#ffb84d':'#ff6b6b';
+          html+=`<div style="margin-top:6px;padding-top:6px;border-top:1px solid rgba(255,255,255,0.1);font-size:11px">
+            <div style="display:flex;justify-content:space-between;margin-bottom:3px"><span style="color:rgba(255,255,255,0.5)">⚡ TTFT P50</span><span style="color:${tc};font-weight:600">${fmtTTFT(d.ttftP50)}</span></div>
+            <div style="display:flex;justify-content:space-between;margin-bottom:3px"><span style="color:rgba(255,255,255,0.5)">🚀 速率 P50</span><span style="color:${sc};font-weight:600">${fmtTPS(d.tpsP50)}</span></div>
+            <div style="color:rgba(255,255,255,0.35);text-align:right;font-size:10px">基于近${d.samples}次请求</div>
+          </div>`;
+        }
+        return html;
       }
     },
     legend:{
       orient:'vertical',right:0,top:'center',
       textStyle:{color:'rgba(255,255,255,0.5)',fontSize:11},
       itemWidth:10,itemHeight:10,
-      formatter(name){return name.length>12?name.slice(0,12)+'…':name},
+      formatter(name){return name.length>16?name.slice(0,16)+'…':name},
     },
     series:[{
       type:'pie',radius:['42%','72%'],
@@ -2150,15 +2218,31 @@ async function loadRecords(){
 // ================================================================
 async function loadModels(){
   try{
-    const res = await fetch('/api/models');
-    const data = await res.json();
+    const [mRes, pRes] = await Promise.all([
+      fetch('/api/models'),
+      fetch('/api/stats/perf').catch(()=>null),
+    ]);
+    const data = await mRes.json();
     allModelsData = data.models||[];
     updateModelMeta(data.stats);
+    if(pRes){
+      const pData = await pRes.json();
+      modelPerfData = pData.data||{};
+    }
     renderModels();
   }catch(e){
     document.getElementById('models-container').innerHTML=
       '<div class="empty"><div class="empty-icon">❌</div><p>加载失败，请刷新重试</p></div>';
   }
+}
+
+async function loadModelPerf(){
+  try{
+    const res = await fetch('/api/stats/perf');
+    const data = await res.json();
+    modelPerfData = data.data||{};
+    if(allModelsData.length>0) renderModels();
+  }catch(e){}
 }
 
 function updateModelMeta(stats){
@@ -2224,15 +2308,33 @@ function renderModels(){
 
 function modelCard(m){
   const short=m.id.includes('/')?m.id.split('/')[1]:m.id;
+  const perf=modelPerfData[m.id];
+  let perfHtml='';
+  if(perf&&perf.samples>0){
+    const ttft=perf.ttft_p50;
+    const tps=perf.tps_p50;
+    const ttftCls=ttft<=200?'good':ttft<=500?'warn':'bad';
+    const tpsCls=tps>=30?'good':tps>=10?'warn':'bad';
+    perfHtml=`<div class="model-perf">
+      <div class="perf-item"><span class="perf-icon">⚡</span><span class="perf-val ${ttftCls}">${ttft}</span><span class="perf-unit">ms</span></div>
+      <div class="perf-item"><span class="perf-icon">🚀</span><span class="perf-val ${tpsCls}">${tps}</span><span class="perf-unit">t/s</span></div>
+      <div class="perf-item" style="margin-left:auto;color:var(--text-tertiary);font-size:10px">${perf.samples}次</div>
+    </div>`;
+  }else{
+    perfHtml=`<div class="model-perf"><div class="perf-item" style="color:var(--text-tertiary);font-size:10px">暂无性能数据</div></div>`;
+  }
   return `<div class="model-card ${m.enabled?'':'disabled'}" id="mcard-${CSS.escape(m.id)}">
-    <div class="model-info" style="min-width:0;flex:1">
-      <div class="model-name" title="${m.id}">${short}</div>
-      <div class="model-id">${m.id}</div>
+    <div class="model-card-main">
+      <div class="model-info" style="min-width:0;flex:1">
+        <div class="model-name" title="${m.id}">${short}</div>
+        <div class="model-id">${m.id}</div>
+      </div>
+      <label class="toggle" title="${m.enabled?'点击禁用':'点击启用'}">
+        <input type="checkbox" ${m.enabled?'checked':''} onchange="toggleModel('${m.id}',this)">
+        <span class="toggle-slider"></span>
+      </label>
     </div>
-    <label class="toggle" title="${m.enabled?'点击禁用':'点击启用'}">
-      <input type="checkbox" ${m.enabled?'checked':''} onchange="toggleModel('${m.id}',this)">
-      <span class="toggle-slider"></span>
-    </label>
+    ${perfHtml}
   </div>`;
 }
 
@@ -2312,12 +2414,13 @@ setInterval(async ()=>{
     document.getElementById('uptime-badge').textContent=ov.uptime||'--:--:--';
     const t=ov.total||{};
     document.getElementById('tb-req').textContent=fmtNum(t.requests||0);
-    // 如果Analytics tab当前处于活跃状态，顺便刷新图表
     if(document.getElementById('tab-analytics').classList.contains('active')){
       loadAnalytics();
     }
   }catch(e){}
 }, 10000);
+
+setInterval(loadModelPerf, 10000);
 </script>
 </body>
 </html>

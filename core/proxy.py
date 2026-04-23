@@ -73,6 +73,8 @@ class NvidiaProxy:
         success: bool,
         stream: bool = False,
         estimated_pt: int = 0,
+        ttft_ms: int = 0,
+        tokens_per_second: float = 0.0,
     ):
         if self.stats is None:
             return
@@ -92,6 +94,8 @@ class NvidiaProxy:
             latency_ms=latency_ms,
             success=success,
             stream=stream,
+            ttft_ms=ttft_ms,
+            tokens_per_second=tokens_per_second,
         )
 
     # ------------------------------------------------------------------
@@ -143,8 +147,12 @@ class NvidiaProxy:
                     f"[{key_obj.alias}] 请求成功 ✅ | 耗时:{elapsed}s | "
                     f"tokens: {getattr(response.usage, 'total_tokens', '?')}"
                 )
-                # ✅ 上报统计
-                self._report(model, key_obj.alias, response.usage, start_time, True, False)
+                _latency_ms = int((time.time() - start_time) * 1000)
+                est_ttft = int(_latency_ms * 0.65) if _latency_ms > 0 else 0
+                ct = getattr(response.usage, 'completion_tokens', 0) or 0
+                est_tps = round(ct / ((_latency_ms - est_ttft) / 1000), 1) if (_latency_ms - est_ttft) > 0 and ct > 0 else 0.0
+                self._report(model, key_obj.alias, response.usage, start_time, True, False,
+                             ttft_ms=est_ttft, tokens_per_second=est_tps)
                 return response
 
             except RateLimitError as e:
@@ -212,6 +220,7 @@ class NvidiaProxy:
             stream_prompt_tokens = 0
             stream_completion_tokens = 0
             stream_content_chars = 0
+            first_token_time = None
 
             try:
                 logger.info(
@@ -236,6 +245,8 @@ class NvidiaProxy:
                     delta = chunk.choices[0].delta.content
                     if delta:
                         stream_content_chars += len(delta)
+                        if first_token_time is None:
+                            first_token_time = time.time()
                     yield f"data: {chunk.model_dump_json()}\n\n"
 
                 yield "data: [DONE]\n\n"
@@ -248,6 +259,9 @@ class NvidiaProxy:
                         stream_completion_tokens = max(1, int(stream_content_chars / 3))
                     if stream_prompt_tokens == 0:
                         stream_prompt_tokens = est_pt
+                    ttft_ms = int((first_token_time - start_time) * 1000) if first_token_time else 0
+                    gen_time = (time.time() - first_token_time) if first_token_time else 0
+                    tps = round(stream_completion_tokens / gen_time, 1) if gen_time > 0 and stream_completion_tokens > 0 else 0.0
                     self.stats.record(
                         model=model,
                         key_alias=key_obj.alias,
@@ -256,6 +270,8 @@ class NvidiaProxy:
                         latency_ms=int((time.time() - start_time) * 1000),
                         success=True,
                         stream=True,
+                        ttft_ms=ttft_ms,
+                        tokens_per_second=tps,
                     )
                 return
 

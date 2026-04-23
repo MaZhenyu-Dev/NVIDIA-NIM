@@ -176,8 +176,14 @@ async def stats_timeline(
 
 @router.get("/api/stats/models", tags=["统计分析"])
 async def stats_models(state: AppState = Depends(get_app_state)):
-    """各模型调用量、Token消耗统计（用于饼图/排行）"""
+    """各模型调用量、Token消耗统计（用于饼图/排行），含性能指标"""
     return {"data": state.stats_manager.get_model_stats()}
+
+
+@router.get("/api/stats/perf", tags=["统计分析"])
+async def stats_perf(state: AppState = Depends(get_app_state)):
+    """各模型性能指标：TTFT P50/P95、Tokens/s P50/P95（轻量接口，供模型卡片轮询）"""
+    return {"data": state.stats_manager.get_all_model_perf()}
 
 
 @router.get("/api/stats/keys", tags=["统计分析"])

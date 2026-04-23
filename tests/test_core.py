@@ -226,6 +226,25 @@ class TestLoadBalancer:
         assert asyncio.run(test())
 
 
+import tempfile
+import os
+
+from sqlalchemy import create_engine, text
+
+from core.database import Base, init_db, _engine as _global_engine
+
+
+def _make_test_db():
+    fd, path = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    engine = create_engine(f"sqlite:///{path}", echo=False)
+    Base.metadata.create_all(engine)
+    with engine.begin() as conn:
+        conn.execute(text("PRAGMA journal_mode=WAL"))
+        conn.execute(text("INSERT OR IGNORE INTO system_meta (key, value) VALUES ('db_schema_version', '1')"))
+    return engine, path
+
+
 # ====================================================================
 # StatsManager 测试
 # ====================================================================
@@ -233,7 +252,25 @@ class TestLoadBalancer:
 class TestStatsManager:
 
     def _make_stats(self):
-        return StatsManager()
+        engine, db_path = _make_test_db()
+        import core.database as db_mod
+        import core.stats_manager as sm_mod
+        orig_get_engine = db_mod.get_engine
+        db_mod.get_engine = lambda: engine
+        try:
+            sm = StatsManager()
+            sm._test_db_path = db_path
+            return sm
+        finally:
+            db_mod.get_engine = orig_get_engine
+
+    @staticmethod
+    def _cleanup_stats(sm):
+        if hasattr(sm, '_test_db_path') and os.path.exists(sm._test_db_path):
+            try:
+                os.unlink(sm._test_db_path)
+            except OSError:
+                pass
 
     def test_record_basic(self):
         sm = self._make_stats()

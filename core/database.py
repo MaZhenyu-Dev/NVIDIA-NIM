@@ -32,6 +32,8 @@ class RequestLog(Base):
     stream = Column(Integer, nullable=False, default=0)
     error_type = Column(Text, nullable=True)
     error_msg = Column(Text, nullable=True)
+    ttft_ms = Column(Integer, nullable=False, default=0)
+    tokens_per_second = Column(Float, nullable=False, default=0.0)
 
     __table_args__ = (
         Index("idx_rl_timestamp", "timestamp"),
@@ -50,6 +52,8 @@ class ModelStat(Base):
     prompt_tokens = Column(Integer, nullable=False, default=0)
     completion_tokens = Column(Integer, nullable=False, default=0)
     total_tokens = Column(Integer, nullable=False, default=0)
+    total_latency_ms = Column(Integer, nullable=False, default=0)
+    latency_count = Column(Integer, nullable=False, default=0)
     last_seen_at = Column(Float, nullable=False, default=0.0)
     first_seen_at = Column(Float, nullable=False, default=0.0)
 
@@ -133,7 +137,7 @@ def init_db():
     engine = get_engine()
     Base.metadata.create_all(engine)
 
-    from sqlalchemy import text
+    from sqlalchemy import text, inspect
     with engine.begin() as conn:
         conn.execute(text(
             "INSERT OR IGNORE INTO system_meta (key, value) VALUES ('db_schema_version', '1')"
@@ -141,6 +145,27 @@ def init_db():
         conn.execute(text(
             "INSERT OR IGNORE INTO system_meta (key, value) VALUES ('total_startup_count', '0')"
         ))
+
+        inspector = inspect(engine)
+        existing_cols = [c["name"] for c in inspector.get_columns("request_logs")]
+        if "ttft_ms" not in existing_cols:
+            conn.execute(text(
+                "ALTER TABLE request_logs ADD COLUMN ttft_ms INTEGER NOT NULL DEFAULT 0"
+            ))
+        if "tokens_per_second" not in existing_cols:
+            conn.execute(text(
+                "ALTER TABLE request_logs ADD COLUMN tokens_per_second REAL NOT NULL DEFAULT 0.0"
+            ))
+
+        model_stat_cols = [c["name"] for c in inspector.get_columns("model_stats")]
+        if "total_latency_ms" not in model_stat_cols:
+            conn.execute(text(
+                "ALTER TABLE model_stats ADD COLUMN total_latency_ms INTEGER NOT NULL DEFAULT 0"
+            ))
+        if "latency_count" not in model_stat_cols:
+            conn.execute(text(
+                "ALTER TABLE model_stats ADD COLUMN latency_count INTEGER NOT NULL DEFAULT 0"
+            ))
 
     startup_count_row = _get_meta("total_startup_count") or "0"
     new_count = int(startup_count_row) + 1
