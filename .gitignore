@@ -1,0 +1,17 @@
+# Runtime
+config.yaml
+models_state.json
+data/
+logs/
+*.db
+*.db-shm
+*.db-wal
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# OS
+.DS_Store

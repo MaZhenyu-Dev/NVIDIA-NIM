@@ -447,6 +447,11 @@ def _convert_anthropic_tools(tools: List[Dict]) -> List[Dict]:
 
         if input_schema is None:
             input_schema = {"type": "object", "properties": {}}
+        else:
+            if input_schema.get("required") is None:
+                input_schema.pop("required", None)
+            if input_schema.get("properties") is None:
+                input_schema["properties"] = {}
 
         openai_tools.append({
             "type": "function",
