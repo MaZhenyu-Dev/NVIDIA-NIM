@@ -128,5 +128,17 @@ class _Config:
     def anthropic_enable_tool_choice(self) -> bool:
         return self.anthropic.get("enable_tool_choice", True)
 
+    @property
+    def model_fallback(self) -> dict:
+        return self.balancer.get("model_fallback", {})
+
+    @property
+    def model_fallback_enabled(self) -> bool:
+        return self.model_fallback.get("enabled", False)
+
+    @property
+    def model_fallback_models(self) -> list:
+        return self.model_fallback.get("models", [])
+
 
 cfg = _Config()

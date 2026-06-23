@@ -1,7 +1,0 @@
-{
-  "env": {
-    "ANTHROPIC_BASE_URL": "http://localhost:8082",
-    "ANTHROPIC_AUTH_TOKEN": "ccnim"
-  },
-  "model": "glm-5.1"
-}

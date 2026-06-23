@@ -18,10 +18,11 @@
 | 🔄 **自动故障转移** | Key 被限流时自动切换，支持可配置的重试次数与超时等待 |
 | 🩺 **健康检查** | 后台周期性检测 Key 状态，自动封禁异常 Key 并在恢复后解禁 |
 | 🌐 **OpenAI 兼容** | 完全兼容 `/v1/chat/completions`、`/v1/models` 等 OpenAI 接口格式 |
-| 🤖 **Anthropic 兼容** | **新增** 支持 Anthropic Messages API 格式（`/v1/messages`），含模型映射、上下文截断、Thinking 模式、Tool Use |
+| 🤖 **Anthropic 兼容** | 支持 Anthropic Messages API 格式（`/v1/messages`），含模型映射、上下文截断、Thinking 模式、Tool Use |
 | 📡 **流式响应** | 完整支持 SSE 流式输出（Streaming），含 Anthropic SSE 事件流转换 |
-| � **前置准入控制** | 原子性预扣配额防止 429 雪崩，支持 `reject_fast`（快速失败）与 `queue_wait`（排队等待）两种模式 |
-| �📈 **可视化监控面板** | 内置 Web Dashboard，实时展示请求趋势、Token 统计、Key 健康状态、调用记录、性能指标（TTFT/Tokens/s P50/P95） |
+| 🔄 **模型级故障转移** | 模型被 429 限流时自动切换到备选模型链，对客户端透明 |
+| 🚦 **前置准入控制** | 原子性预扣配额防止 429 雪崩，支持 `reject_fast`（快速失败）与 `queue_wait`（排队等待）两种模式 |
+| 📈 **可视化监控面板** | 内置 Web Dashboard，实时展示请求趋势、Token 统计、Key 健康状态、调用记录、性能指标（TTFT/Tokens/s P50/P95） |
 | 💾 **SQLite 持久化** | 异步批量写入（WriteBuffer），统计数据不丢，重启后历史数据保留 |
 | 🎛️ **模型管理 API** | 支持模型启用/禁用、分组展示、从 NVIDIA 自动拉取最新模型列表 |
 
@@ -36,7 +37,7 @@
         ▼
 ┌───────────────────────────────────────────────┐
 │           FastAPI 本地代理服务                  │
-│           http://localhost:8000                │
+│           http://localhost:8082                │
 │                                               │
 │   ┌──────────────────┐  ┌──────────────────┐  │
 │   │  OpenAI 兼容层    │  │ Anthropic 兼容层  │  │
@@ -154,30 +155,37 @@ keys:
 # ── NVIDIA API 配置 ──────────────────────────────────────
 nvidia:
   base_url: "https://integrate.api.nvidia.com/v1"
-  default_model: "meta/llama-3.1-70b-instruct"
-  rpm_limit: 40                    # 每 Key 每分钟请求上限
-  rpm_buffer: 5                     # 安全余量
+  default_model: "deepseek-ai/deepseek-v4-flash"
+  rpm_limit: 30                     # 每 Key 每分钟请求上限
+  rpm_buffer: 3                     # 安全余量
 
 # ── 负载均衡配置 ─────────────────────────────────────────
 balancer:
   strategy: "most_remaining"        # 可选: most_remaining / round_robin / least_used
   wait_timeout: 65                  # 无可用 Key 时等待超时（秒）
-  max_retries: 3                    # 失败重试次数
+  max_retries: 1                    # 失败重试次数
 
   # 前置准入控制 (Admission Control)
   # 防止并发请求超过所有 Key 的总配额，从源头避免 NVIDIA 返回 429 雪崩
-  #
-  # admission_mode:
-  #   - "reject_fast": 快速失败模式（推荐高并发场景）
-  #       配额不足时立即返回 HTTP 429，客户端可据此自动重试
-  #   - "queue_wait": 排队等待模式（推荐交互式/低延迟场景）
-  #       配额不足时智能等待，直到有配额释放或超时
-  admission_mode: "reject_fast"    # reject_fast | queue_wait
-  queue_wait_timeout: 30          # 单位：秒，推荐 10~60
+  admission_mode: "queue_wait"     # reject_fast | queue_wait
+  queue_wait_timeout: 30           # 单位：秒，推荐 10~60
+
+  # ★ 模型级故障转移 (Model Fallback)
+  # 当主模型被 NVIDIA 429 限流时，自动切换到备选模型重试
+  # 仅在所有 Key 均返回 RateLimitError (429) 时触发
+  # 非 429 错误不会触发降级，避免掩盖真实故障
+  model_fallback:
+    enabled: true                    # 是否启用
+    models:                         # 按优先级排列的备选模型链
+      - "deepseek-ai/deepseek-v4-flash"
+      - "moonshotai/kimi-k2.6"
+      - "minimaxai/minimax-m2.7"
+      - "z-ai/glm-5.1"
+      - "deepseek-ai/deepseek-v4-pro"
 
 # ── 服务配置 ──────────────────────────────────────────────
 server:
-  port: 8000                        # 服务监听端口
+  port: 8082                        # 服务监听端口
 
 # ── 日志配置 ──────────────────────────────────────────────
 logging:
@@ -189,37 +197,41 @@ logging:
 models:
   auto_fetch: true                  # 启动时自动从 NVIDIA 拉取模型列表
   fallback_list:                    # 拉取失败时的备用模型列表
-    - "meta/llama-3.1-70b-instruct"
-    - "meta/llama-3.1-405b-instruct"
-    - "meta/llama-3.1-8b-instruct"
+    - "deepseek-ai/deepseek-v4-flash"
+    - "moonshotai/kimi-k2.6"
+    - "minimaxai/minimax-m2.7"
+    - "z-ai/glm-5.1"
+    - "deepseek-ai/deepseek-v4-pro"
 
-# ── Anthropic 兼容配置（★ 新增）───────────────────────────
+# ── Anthropic 兼容配置 ───────────────────────────────────
 anthropic:
-  default_model: "claude-haiku-4-5-20251001"
-  
-  # 模型名称映射：Anthropic 模型名 → NVIDIA 模型名
+  default_model: "deepseek-v4-flash"
+
+  # 模型名称映射：简短别名 → NVIDIA 模型名
   model_mapping:
-    "claude-opus-4-7": "moonshotai/kimi-k2.5"
-    "claude-opus-4-6": "moonshotai/kimi-k2.5"
-    "claude-sonnet-4-6": "qwen/qwen3.5-397b-a17b"
-    "claude-haiku-4-5-20251001": "moonshotai/kimi-k2-instruct-0905"
-  
+    "deepseek-v4-flash": "deepseek-ai/deepseek-v4-flash"
+    "deepseek-v4-pro": "deepseek-ai/deepseek-v4-pro"
+    "kimi": "moonshotai/kimi-k2.6"
+    "minimax": "minimaxai/minimax-m2.7"
+    "glm": "z-ai/glm-5.1"
+
   # 各模型的上下文窗口大小（用于消息截断）
   context_windows:
-    "claude-opus-4-7": 1000000
-    "claude-opus-4-6": 1000000
-    "claude-sonnet-4-6": 256000
-    "claude-haiku-4-5-20251001": 200000
+    "deepseek-v4-flash": 1000000
+    "deepseek-v4-pro": 1000000
+    "kimi": 262000
+    "minimax": 200000
+    "glm": 200000
   default_context_window: 200000
-  
+
   # 消息截断策略（超出上下文窗口时）
   truncation_strategy: "recent"      # recent: 保留最近消息 | middle: 从中间截断
   truncation_buffer_ratio: 0.10      # 截断缓冲比例（预留 10% 给输出）
-  
+
   # Thinking（扩展思考）模式支持
   enable_thinking: true
   default_thinking_budget: 1024      # 默认 thinking token 预算
-  
+
   # Tool Choice 支持
   enable_tool_choice: true
 ```
@@ -231,10 +243,10 @@ python main.py
 ```
 
 启动成功后：
-- **OpenAI API 地址：** `http://localhost:8000/v1`
-- **Anthropic API 地址：** `http://localhost:8000/v1`（携带 `anthropic-version` header）
-- **监控面板：** `http://localhost:8000/dashboard`
-- **健康检查：** `http://localhost:8000/health`
+- **OpenAI API 地址：** `http://localhost:8082/v1`
+- **Anthropic API 地址：** `http://localhost:8082/v1`（携带 `anthropic-version` header）
+- **监控面板：** `http://localhost:8082/dashboard`
+- **健康检查：** `http://localhost:8082/health`
 
 ---
 
@@ -244,19 +256,19 @@ python main.py
 
 ```bash
 # Chat Completions
-curl http://localhost:8000/v1/chat/completions \
+curl http://localhost:8082/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "meta/llama-3.1-70b-instruct",
+    "model": "deepseek-ai/deepseek-v4-flash",
     "messages": [{"role": "user", "content": "你好"}],
     "stream": true
   }'
 
 # 获取模型列表
-curl http://localhost:8000/v1/models
+curl http://localhost:8082/v1/models
 
 # 健康检查
-curl http://localhost:8000/health
+curl http://localhost:8082/health
 ```
 
 ### Anthropic 格式调用（★ 新增）
@@ -265,12 +277,12 @@ curl http://localhost:8000/health
 
 ```bash
 # Messages API（完全兼容 Anthropic SDK）
-curl http://localhost:8000/v1/messages \
+curl http://localhost:8082/v1/messages \
   -H "Content-Type: application/json" \
   -H "anthropic-version: 2023-06-01" \
   -H "x-api-key: any-string" \
   -d '{
-    "model": "claude-sonnet-4-6",
+    "model": "deepseek-v4-flash",
     "max_tokens": 1024,
     "messages": [
       {"role": "user", "content": "你好"}
@@ -278,11 +290,11 @@ curl http://localhost:8000/v1/messages \
   }'
 
 # 获取模型列表（Anthropic 格式）
-curl http://localhost:8000/v1/models \
+curl http://localhost:8082/v1/models \
   -H "anthropic-version: 2023-06-01"
 
 # Token 计数估算
-curl http://localhost:8000/v1/messages/count_tokens \
+curl http://localhost:8082/v1/messages/count_tokens \
   -H "Content-Type: application/json" \
   -H "anthropic-version: 2023-06-01" \
   -d '{
@@ -330,12 +342,14 @@ curl http://localhost:8000/v1/messages/count_tokens \
 
 ```bash
 # 设置环境变量
-export ANTHROPIC_BASE_URL="http://localhost:8000"
+export ANTHROPIC_BASE_URL="http://localhost:8082"
 export ANTHROPIC_API_KEY="any-string"
 export ANTHROPIC_AUTH_TOKEN="any-string"
 
 # 或在 ~/.claude/settings.json 中配置
 ```
+
+项目附带 `scripts/all_in_one.sh`，可一键切换 Claude Code 模型（deepseek-v4-flash / kimi / minimax / glm / deepseek-v4-pro）。
 
 ---
 
@@ -407,6 +421,30 @@ export ANTHROPIC_AUTH_TOKEN="any-string"
 |------|----------|------|
 | `reject_fast` | 高并发 / API 调用 | 配额不足立即返回 429，零资源浪费 |
 | `queue_wait` | 交互式 / 聊天 | 智能等待配额释放，用户无感知 |
+
+### 模型级故障转移（Model Fallback）
+
+NVIDIA NIM 各模型的速率限制不同。例如 `deepseek-ai/deepseek-v4-flash` 免费额度消耗极快，而 `deepseek-ai/deepseek-v4-pro` 更稳定。Model Fallback 自动处理这种差异：
+
+```text
+客户端请求: deepseek-ai/deepseek-v4-flash
+       ↓ 首次尝试
+  flash 被 429 → kimi-k2.6 被 429 → minimax-m2.7 → ... → v4-pro 成功
+       ↓
+响应返回: deepseek-ai/deepseek-v4-flash (对客户端透明)
+```
+
+关键行为：
+- **触发条件**：仅当所有 Key 都返回 `RateLimitError` (429) 时触发
+- **非 429 不降级**：如 401/500/超时等不触发，避免掩盖真实错误
+- **范围**：OpenAI 和 Anthropic 双协议均受益（在 proxy.py transport 层实现）
+- **客户端透明**：响应中的 `model` 字段保持原始请求值，客户端无感知
+
+配置位于 `balancer.model_fallback`：
+| 字段 | 说明 |
+|------|------|
+| `enabled` | 启用/禁用故障转移 |
+| `models` | 按优先级排列的备选模型链（按顺序尝试） |
 
 ### Anthropic 模型映射原理
 

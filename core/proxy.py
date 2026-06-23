@@ -16,6 +16,7 @@ from openai import AsyncOpenAI, RateLimitError, APIStatusError, APIConnectionErr
 
 from core.balancer import LoadBalancer, PoolExhaustedError
 from core.key_pool import APIKey
+from core.config import cfg
 
 
 class AdmissionRejectedException(Exception):
@@ -134,6 +135,16 @@ class NvidiaProxy:
     # 非流式请求
     # ------------------------------------------------------------------
 
+    def _build_model_chain(self, model: str) -> List[str]:
+        fallback_models = cfg.model_fallback_models
+        if cfg.model_fallback_enabled and fallback_models:
+            chain = [model]
+            for fb in fallback_models:
+                if fb != model:
+                    chain.append(fb)
+            return chain
+        return [model]
+
     async def chat_completion(
         self,
         messages: List[Dict],
@@ -148,75 +159,85 @@ class NvidiaProxy:
         last_exception = None
         est_pt = self._estimate_prompt_tokens(messages)
 
-        for attempt in range(1, self.max_retries + 1):
-            key_obj, exhausted_info = await self.balancer.acquire_for_proxy()
-            if key_obj is None:
-                raise AdmissionRejectedException(exhausted_info)
-
-            key_obj.record_request()
-            client = self._make_client(key_obj.key)
-            start_time = time.time()
-
-            try:
-                logger.info(
-                    f"[{key_obj.alias}] 非流式请求 | model={model} | attempt={attempt}/{self.max_retries}"
+        model_chain = self._build_model_chain(model)
+        for chain_idx, current_model in enumerate(model_chain):
+            if chain_idx > 0:
+                logger.warning(
+                    f"[降级] 模型 {model} 被限流，切换到备选模型: {current_model}"
                 )
-                response = await client.chat.completions.create(
-                    model=model,
-                    messages=messages,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                    top_p=top_p,
-                    stream=False,
-                    **extra_params,
-                )
-                elapsed = round(time.time() - start_time, 2)
-                logger.info(
-                    f"[{key_obj.alias}] 请求成功 ✅ | 耗时:{elapsed}s | "
-                    f"tokens: {getattr(response.usage, 'total_tokens', '?')}"
-                )
-                _latency_ms = int((time.time() - start_time) * 1000)
-                est_ttft = int(_latency_ms * 0.65) if _latency_ms > 0 else 0
-                ct = getattr(response.usage, 'completion_tokens', 0) or 0
-                est_tps = round(ct / ((_latency_ms - est_ttft) / 1000), 1) if (_latency_ms - est_ttft) > 0 and ct > 0 else 0.0
-                self._report(model, key_obj.alias, response.usage, start_time, True, False,
-                             ttft_ms=est_ttft, tokens_per_second=est_tps)
-                return response
 
-            except RateLimitError as e:
-                key_obj.record_rate_limit_error()
-                last_exception = e
-                wait = self._backoff(attempt, base=0.5, cap=2.0)
-                logger.warning(f"[{key_obj.alias}] Rate Limit (429)，{wait:.2f}s 后切换Key重试...")
-                await asyncio.sleep(wait)
+            for attempt in range(1, self.max_retries + 1):
+                key_obj, exhausted_info = await self.balancer.acquire_for_proxy()
+                if key_obj is None:
+                    raise AdmissionRejectedException(exhausted_info)
 
-            except APIConnectionError as e:
-                key_obj.record_general_error()
-                last_exception = e
-                wait = self._backoff(attempt)
-                logger.warning(f"[{key_obj.alias}] 网络错误，{wait:.2f}s 后重试: {e}")
-                await asyncio.sleep(wait)
+                key_obj.record_request()
+                client = self._make_client(key_obj.key)
+                start_time = time.time()
 
-            except APIStatusError as e:
-                key_obj.record_general_error()
-                last_exception = e
-                if e.status_code >= 500:
+                try:
+                    logger.info(
+                        f"[{key_obj.alias}] 非流式请求 | model={current_model} | attempt={attempt}/{self.max_retries}"
+                    )
+                    response = await client.chat.completions.create(
+                        model=current_model,
+                        messages=messages,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        top_p=top_p,
+                        stream=False,
+                        **extra_params,
+                    )
+                    elapsed = round(time.time() - start_time, 2)
+                    logger.info(
+                        f"[{key_obj.alias}] 请求成功 ✅ | 耗时:{elapsed}s | "
+                        f"tokens: {getattr(response.usage, 'total_tokens', '?')}"
+                    )
+                    _latency_ms = int((time.time() - start_time) * 1000)
+                    est_ttft = int(_latency_ms * 0.65) if _latency_ms > 0 else 0
+                    ct = getattr(response.usage, 'completion_tokens', 0) or 0
+                    est_tps = round(ct / ((_latency_ms - est_ttft) / 1000), 1) if (_latency_ms - est_ttft) > 0 and ct > 0 else 0.0
+                    self._report(current_model, key_obj.alias, response.usage, start_time, True, False,
+                                 ttft_ms=est_ttft, tokens_per_second=est_tps)
+                    return response
+
+                except RateLimitError as e:
+                    key_obj.record_rate_limit_error()
+                    last_exception = e
+                    wait = self._backoff(attempt, base=0.5, cap=2.0)
+                    logger.warning(f"[{key_obj.alias}] Rate Limit (429)，{wait:.2f}s 后切换Key重试...")
+                    await asyncio.sleep(wait)
+
+                except APIConnectionError as e:
+                    key_obj.record_general_error()
+                    last_exception = e
                     wait = self._backoff(attempt)
-                    logger.warning(f"[{key_obj.alias}] 服务端错误 {e.status_code}，{wait:.2f}s 后重试")
+                    logger.warning(f"[{key_obj.alias}] 网络错误，{wait:.2f}s 后重试: {e}")
                     await asyncio.sleep(wait)
-                else:
-                    logger.error(f"[{key_obj.alias}] 客户端错误 {e.status_code}: {e.message}")
-                    break
 
-            except Exception as e:
-                key_obj.record_general_error()
-                last_exception = e
-                wait = self._backoff(attempt)
-                logger.error(f"[{key_obj.alias}] 未知错误，{wait:.2f}s 后重试: {e}")
-                if attempt < self.max_retries:
-                    await asyncio.sleep(wait)
-                else:
-                    break
+                except APIStatusError as e:
+                    key_obj.record_general_error()
+                    last_exception = e
+                    if e.status_code >= 500:
+                        wait = self._backoff(attempt)
+                        logger.warning(f"[{key_obj.alias}] 服务端错误 {e.status_code}，{wait:.2f}s 后重试")
+                        await asyncio.sleep(wait)
+                    else:
+                        logger.error(f"[{key_obj.alias}] 客户端错误 {e.status_code}: {e.message}")
+                        break
+
+                except Exception as e:
+                    key_obj.record_general_error()
+                    last_exception = e
+                    wait = self._backoff(attempt)
+                    logger.error(f"[{key_obj.alias}] 未知错误，{wait:.2f}s 后重试: {e}")
+                    if attempt < self.max_retries:
+                        await asyncio.sleep(wait)
+                    else:
+                        break
+
+            if not isinstance(last_exception, RateLimitError):
+                break
 
         self._report(model, "unknown", None, time.time(), False, False, estimated_pt=est_pt)
         raise last_exception or RuntimeError("请求失败，已达最大重试次数")
@@ -239,118 +260,128 @@ class NvidiaProxy:
         last_exception = None
         est_pt = self._estimate_prompt_tokens(messages)
 
-        for attempt in range(1, self.max_retries + 1):
-            key_obj, exhausted_info = await self.balancer.acquire_for_proxy()
-            if key_obj is None:
-                raise AdmissionRejectedException(exhausted_info)
-
-            key_obj.record_request()
-            client = self._make_client(key_obj.key)
-            start_time = time.time()
-
-            stream_prompt_tokens = 0
-            stream_completion_tokens = 0
-            stream_content_chars = 0
-            first_token_time = None
-            stream_started = False
-
-            try:
-                logger.info(
-                    f"[{key_obj.alias}] 流式请求 | model={model} | attempt={attempt}/{self.max_retries}"
-                )
-                response_stream = await client.chat.completions.create(
-                    model=model,
-                    messages=messages,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                    top_p=top_p,
-                    stream=True,
-                    **extra_params,
+        model_chain = self._build_model_chain(model)
+        for chain_idx, current_model in enumerate(model_chain):
+            if chain_idx > 0:
+                logger.warning(
+                    f"[降级] 流式请求: 模型 {model} 被限流，切换到备选模型: {current_model}"
                 )
 
-                async for chunk in response_stream:
-                    if not chunk.choices:
-                        if hasattr(chunk, 'usage') and chunk.usage:
-                            stream_prompt_tokens = chunk.usage.prompt_tokens or 0
-                            stream_completion_tokens = chunk.usage.completion_tokens or 0
-                        continue
-                    delta = chunk.choices[0].delta.content
-                    if delta:
-                        stream_content_chars += len(delta)
-                        if first_token_time is None:
-                            first_token_time = time.time()
-                    stream_started = True
-                    chunk_dict = chunk.model_dump()
-                    if not isinstance(chunk_dict.get("id"), str):
-                        chunk_dict["id"] = "chatcmpl-nim-proxy"
-                    yield f"data: {json.dumps(chunk_dict, ensure_ascii=False)}\n\n"
+            for attempt in range(1, self.max_retries + 1):
+                key_obj, exhausted_info = await self.balancer.acquire_for_proxy()
+                if key_obj is None:
+                    raise AdmissionRejectedException(exhausted_info)
 
-                elapsed = round(time.time() - start_time, 2)
-                logger.info(f"[{key_obj.alias}] 流式完成 ✅ | 耗时:{elapsed}s")
+                key_obj.record_request()
+                client = self._make_client(key_obj.key)
+                start_time = time.time()
 
-                if self.stats:
-                    if stream_completion_tokens == 0 and stream_content_chars > 0:
-                        stream_completion_tokens = max(1, int(stream_content_chars / 3))
-                    if stream_prompt_tokens == 0:
-                        stream_prompt_tokens = est_pt
-                    ttft_ms = int((first_token_time - start_time) * 1000) if first_token_time else 0
-                    gen_time = (time.time() - first_token_time) if first_token_time else 0
-                    tps = round(stream_completion_tokens / gen_time, 1) if gen_time > 0 and stream_completion_tokens > 0 else 0.0
-                    self.stats.record(
-                        model=model,
-                        key_alias=key_obj.alias,
-                        prompt_tokens=stream_prompt_tokens,
-                        completion_tokens=stream_completion_tokens,
-                        latency_ms=int((time.time() - start_time) * 1000),
-                        success=True,
+                stream_prompt_tokens = 0
+                stream_completion_tokens = 0
+                stream_content_chars = 0
+                first_token_time = None
+                stream_started = False
+
+                try:
+                    logger.info(
+                        f"[{key_obj.alias}] 流式请求 | model={current_model} | attempt={attempt}/{self.max_retries}"
+                    )
+                    response_stream = await client.chat.completions.create(
+                        model=current_model,
+                        messages=messages,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        top_p=top_p,
                         stream=True,
-                        ttft_ms=ttft_ms,
-                        tokens_per_second=tps,
+                        **extra_params,
                     )
 
-                yield "data: [DONE]\n\n"
-                return
+                    async for chunk in response_stream:
+                        if not chunk.choices:
+                            if hasattr(chunk, 'usage') and chunk.usage:
+                                stream_prompt_tokens = chunk.usage.prompt_tokens or 0
+                                stream_completion_tokens = chunk.usage.completion_tokens or 0
+                            continue
+                        delta = chunk.choices[0].delta.content
+                        if delta:
+                            stream_content_chars += len(delta)
+                            if first_token_time is None:
+                                first_token_time = time.time()
+                        stream_started = True
+                        chunk_dict = chunk.model_dump()
+                        if not isinstance(chunk_dict.get("id"), str):
+                            chunk_dict["id"] = "chatcmpl-nim-proxy"
+                        yield f"data: {json.dumps(chunk_dict, ensure_ascii=False)}\n\n"
 
-            except RateLimitError as e:
-                key_obj.record_rate_limit_error()
-                last_exception = e
-                if stream_started:
-                    break
-                wait = self._backoff(attempt, base=0.5, cap=2.0)
-                logger.warning(f"[{key_obj.alias}] 流式 Rate Limit，{wait:.2f}s 后切换Key重试")
-                await asyncio.sleep(wait)
+                    elapsed = round(time.time() - start_time, 2)
+                    logger.info(f"[{key_obj.alias}] 流式完成 ✅ | 耗时:{elapsed}s")
 
-            except APIConnectionError as e:
-                key_obj.record_general_error()
-                last_exception = e
-                if stream_started:
-                    break
-                wait = self._backoff(attempt)
-                logger.warning(f"[{key_obj.alias}] 流式网络错误，{wait:.2f}s 后重试")
-                await asyncio.sleep(wait)
+                    if self.stats:
+                        if stream_completion_tokens == 0 and stream_content_chars > 0:
+                            stream_completion_tokens = max(1, int(stream_content_chars / 3))
+                        if stream_prompt_tokens == 0:
+                            stream_prompt_tokens = est_pt
+                        ttft_ms = int((first_token_time - start_time) * 1000) if first_token_time else 0
+                        gen_time = (time.time() - first_token_time) if first_token_time else 0
+                        tps = round(stream_completion_tokens / gen_time, 1) if gen_time > 0 and stream_completion_tokens > 0 else 0.0
+                        self.stats.record(
+                            model=model,
+                            key_alias=key_obj.alias,
+                            prompt_tokens=stream_prompt_tokens,
+                            completion_tokens=stream_completion_tokens,
+                            latency_ms=int((time.time() - start_time) * 1000),
+                            success=True,
+                            stream=True,
+                            ttft_ms=ttft_ms,
+                            tokens_per_second=tps,
+                        )
 
-            except APIStatusError as e:
-                key_obj.record_general_error()
-                last_exception = e
-                if stream_started:
-                    break
-                if e.status_code >= 500:
+                    yield "data: [DONE]\n\n"
+                    return
+
+                except RateLimitError as e:
+                    key_obj.record_rate_limit_error()
+                    last_exception = e
+                    if stream_started:
+                        break
+                    wait = self._backoff(attempt, base=0.5, cap=2.0)
+                    logger.warning(f"[{key_obj.alias}] 流式 Rate Limit，{wait:.2f}s 后切换Key重试")
+                    await asyncio.sleep(wait)
+
+                except APIConnectionError as e:
+                    key_obj.record_general_error()
+                    last_exception = e
+                    if stream_started:
+                        break
                     wait = self._backoff(attempt)
-                    logger.warning(f"[{key_obj.alias}] 流式服务端错误，{wait:.2f}s 后重试")
+                    logger.warning(f"[{key_obj.alias}] 流式网络错误，{wait:.2f}s 后重试")
                     await asyncio.sleep(wait)
-                else:
-                    break
 
-            except Exception as e:
-                key_obj.record_general_error()
-                last_exception = e
-                if stream_started:
-                    break
-                wait = self._backoff(attempt)
-                logger.error(f"[{key_obj.alias}] 流式未知错误，{wait:.2f}s 后重试: {e}")
-                if attempt < self.max_retries:
-                    await asyncio.sleep(wait)
-                else:
+                except APIStatusError as e:
+                    key_obj.record_general_error()
+                    last_exception = e
+                    if stream_started:
+                        break
+                    if e.status_code >= 500:
+                        wait = self._backoff(attempt)
+                        logger.warning(f"[{key_obj.alias}] 流式服务端错误，{wait:.2f}s 后重试")
+                        await asyncio.sleep(wait)
+                    else:
+                        break
+
+                except Exception as e:
+                    key_obj.record_general_error()
+                    last_exception = e
+                    if stream_started:
+                        break
+                    wait = self._backoff(attempt)
+                    logger.error(f"[{key_obj.alias}] 流式未知错误，{wait:.2f}s 后重试: {e}")
+                    if attempt < self.max_retries:
+                        await asyncio.sleep(wait)
+                    else:
+                        break
+
+                if not isinstance(last_exception, RateLimitError):
                     break
 
         self._report(model, "unknown", None, time.time(), False, True, estimated_pt=est_pt)
@@ -374,118 +405,128 @@ class NvidiaProxy:
         last_exception = None
         est_pt = self._estimate_prompt_tokens(messages)
 
-        for attempt in range(1, self.max_retries + 1):
-            key_obj, exhausted_info = await self.balancer.acquire_for_proxy()
-            if key_obj is None:
-                raise AdmissionRejectedException(exhausted_info)
-
-            key_obj.record_request()
-            client = self._make_client(key_obj.key)
-            start_time = time.time()
-
-            stream_prompt_tokens = 0
-            stream_completion_tokens = 0
-            stream_content_chars = 0
-            first_token_time = None
-            stream_started = False
-
-            try:
-                logger.info(
-                    f"[{key_obj.alias}] 原始流式请求 | model={model} | attempt={attempt}/{self.max_retries}"
-                )
-                response_stream = await client.chat.completions.create(
-                    model=model,
-                    messages=messages,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                    top_p=top_p,
-                    stream=True,
-                    **extra_params,
+        model_chain = self._build_model_chain(model)
+        for chain_idx, current_model in enumerate(model_chain):
+            if chain_idx > 0:
+                logger.warning(
+                    f"[降级] 原始流式请求: 模型 {model} 被限流，切换到备选模型: {current_model}"
                 )
 
-                async for chunk in response_stream:
-                    if not chunk.choices:
-                        if hasattr(chunk, 'usage') and chunk.usage:
-                            stream_prompt_tokens = chunk.usage.prompt_tokens or 0
-                            stream_completion_tokens = chunk.usage.completion_tokens or 0
-                        continue
-                    delta = chunk.choices[0].delta.content
-                    if delta:
-                        stream_content_chars += len(delta)
-                        if first_token_time is None:
-                            first_token_time = time.time()
-                    stream_started = True
-                    chunk_dict = chunk.model_dump()
-                    if not isinstance(chunk_dict.get("id"), str):
-                        chunk_dict["id"] = "chatcmpl-nim-proxy"
-                    yield f"data: {json.dumps(chunk_dict, ensure_ascii=False)}\n\n"
+            for attempt in range(1, self.max_retries + 1):
+                key_obj, exhausted_info = await self.balancer.acquire_for_proxy()
+                if key_obj is None:
+                    raise AdmissionRejectedException(exhausted_info)
 
-                elapsed = round(time.time() - start_time, 2)
-                logger.info(f"[{key_obj.alias}] 原始流式完成 ✅ | 耗时:{elapsed}s")
+                key_obj.record_request()
+                client = self._make_client(key_obj.key)
+                start_time = time.time()
 
-                if self.stats:
-                    if stream_completion_tokens == 0 and stream_content_chars > 0:
-                        stream_completion_tokens = max(1, int(stream_content_chars / 3))
-                    if stream_prompt_tokens == 0:
-                        stream_prompt_tokens = est_pt
-                    ttft_ms = int((first_token_time - start_time) * 1000) if first_token_time else 0
-                    gen_time = (time.time() - first_token_time) if first_token_time else 0
-                    tps = round(stream_completion_tokens / gen_time, 1) if gen_time > 0 and stream_completion_tokens > 0 else 0.0
-                    self.stats.record(
-                        model=model,
-                        key_alias=key_obj.alias,
-                        prompt_tokens=stream_prompt_tokens,
-                        completion_tokens=stream_completion_tokens,
-                        latency_ms=int((time.time() - start_time) * 1000),
-                        success=True,
+                stream_prompt_tokens = 0
+                stream_completion_tokens = 0
+                stream_content_chars = 0
+                first_token_time = None
+                stream_started = False
+
+                try:
+                    logger.info(
+                        f"[{key_obj.alias}] 原始流式请求 | model={current_model} | attempt={attempt}/{self.max_retries}"
+                    )
+                    response_stream = await client.chat.completions.create(
+                        model=current_model,
+                        messages=messages,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        top_p=top_p,
                         stream=True,
-                        ttft_ms=ttft_ms,
-                        tokens_per_second=tps,
+                        **extra_params,
                     )
 
-                yield "data: [DONE]\n\n"
-                return
+                    async for chunk in response_stream:
+                        if not chunk.choices:
+                            if hasattr(chunk, 'usage') and chunk.usage:
+                                stream_prompt_tokens = chunk.usage.prompt_tokens or 0
+                                stream_completion_tokens = chunk.usage.completion_tokens or 0
+                            continue
+                        delta = chunk.choices[0].delta.content
+                        if delta:
+                            stream_content_chars += len(delta)
+                            if first_token_time is None:
+                                first_token_time = time.time()
+                        stream_started = True
+                        chunk_dict = chunk.model_dump()
+                        if not isinstance(chunk_dict.get("id"), str):
+                            chunk_dict["id"] = "chatcmpl-nim-proxy"
+                        yield f"data: {json.dumps(chunk_dict, ensure_ascii=False)}\n\n"
 
-            except RateLimitError as e:
-                key_obj.record_rate_limit_error()
-                last_exception = e
-                if stream_started:
-                    break
-                wait = self._backoff(attempt, base=0.5, cap=2.0)
-                logger.warning(f"[{key_obj.alias}] 原始流式 Rate Limit，{wait:.2f}s 后切换Key重试")
-                await asyncio.sleep(wait)
+                    elapsed = round(time.time() - start_time, 2)
+                    logger.info(f"[{key_obj.alias}] 原始流式完成 ✅ | 耗时:{elapsed}s")
 
-            except APIConnectionError as e:
-                key_obj.record_general_error()
-                last_exception = e
-                if stream_started:
-                    break
-                wait = self._backoff(attempt)
-                logger.warning(f"[{key_obj.alias}] 原始流式网络错误，{wait:.2f}s 后重试")
-                await asyncio.sleep(wait)
+                    if self.stats:
+                        if stream_completion_tokens == 0 and stream_content_chars > 0:
+                            stream_completion_tokens = max(1, int(stream_content_chars / 3))
+                        if stream_prompt_tokens == 0:
+                            stream_prompt_tokens = est_pt
+                        ttft_ms = int((first_token_time - start_time) * 1000) if first_token_time else 0
+                        gen_time = (time.time() - first_token_time) if first_token_time else 0
+                        tps = round(stream_completion_tokens / gen_time, 1) if gen_time > 0 and stream_completion_tokens > 0 else 0.0
+                        self.stats.record(
+                            model=model,
+                            key_alias=key_obj.alias,
+                            prompt_tokens=stream_prompt_tokens,
+                            completion_tokens=stream_completion_tokens,
+                            latency_ms=int((time.time() - start_time) * 1000),
+                            success=True,
+                            stream=True,
+                            ttft_ms=ttft_ms,
+                            tokens_per_second=tps,
+                        )
 
-            except APIStatusError as e:
-                key_obj.record_general_error()
-                last_exception = e
-                if stream_started:
-                    break
-                if e.status_code >= 500:
+                    yield "data: [DONE]\n\n"
+                    return
+
+                except RateLimitError as e:
+                    key_obj.record_rate_limit_error()
+                    last_exception = e
+                    if stream_started:
+                        break
+                    wait = self._backoff(attempt, base=0.5, cap=2.0)
+                    logger.warning(f"[{key_obj.alias}] 原始流式 Rate Limit，{wait:.2f}s 后切换Key重试")
+                    await asyncio.sleep(wait)
+
+                except APIConnectionError as e:
+                    key_obj.record_general_error()
+                    last_exception = e
+                    if stream_started:
+                        break
                     wait = self._backoff(attempt)
-                    logger.warning(f"[{key_obj.alias}] 原始流式服务端错误，{wait:.2f}s 后重试")
+                    logger.warning(f"[{key_obj.alias}] 原始流式网络错误，{wait:.2f}s 后重试")
                     await asyncio.sleep(wait)
-                else:
-                    break
 
-            except Exception as e:
-                key_obj.record_general_error()
-                last_exception = e
-                if stream_started:
-                    break
-                wait = self._backoff(attempt)
-                logger.error(f"[{key_obj.alias}] 原始流式未知错误，{wait:.2f}s 后重试: {e}")
-                if attempt < self.max_retries:
-                    await asyncio.sleep(wait)
-                else:
+                except APIStatusError as e:
+                    key_obj.record_general_error()
+                    last_exception = e
+                    if stream_started:
+                        break
+                    if e.status_code >= 500:
+                        wait = self._backoff(attempt)
+                        logger.warning(f"[{key_obj.alias}] 原始流式服务端错误，{wait:.2f}s 后重试")
+                        await asyncio.sleep(wait)
+                    else:
+                        break
+
+                except Exception as e:
+                    key_obj.record_general_error()
+                    last_exception = e
+                    if stream_started:
+                        break
+                    wait = self._backoff(attempt)
+                    logger.error(f"[{key_obj.alias}] 原始流式未知错误，{wait:.2f}s 后重试: {e}")
+                    if attempt < self.max_retries:
+                        await asyncio.sleep(wait)
+                    else:
+                        break
+
+                if not isinstance(last_exception, RateLimitError):
                     break
 
         self._report(model, "unknown", None, time.time(), False, True, estimated_pt=est_pt)

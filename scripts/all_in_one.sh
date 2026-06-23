@@ -1,6 +1,6 @@
 #!/bin/bash
 # ./scripts/all_in_one.sh <model>  切换模型并启动代理
-# 模型: dp_flash (默认), dp_pro, glm, kimi
+# 模型: dp_flash (默认), dp_pro, kimi, minimax, glm
 
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 PYTHON="$PROJECT_DIR/.venv/bin/python"
@@ -12,8 +12,9 @@ case "${1:-dp_flash}" in
     echo "模型:"
     echo "  dp_flash   DeepSeek V4 Flash（默认）"
     echo "  dp_pro     DeepSeek V4 Pro"
-    echo "  glm        GLM-5.1"
     echo "  kimi       Kimi K2.6"
+    echo "  minimax    MiniMax M2.7"
+    echo "  glm        GLM-5.1"
     echo "  stop       关停代理"
     exit 0
     ;;
@@ -29,11 +30,12 @@ case "${1:-dp_flash}" in
     ;;
   dp_flash) MODEL="deepseek-v4-flash" ;;
   dp_pro)   MODEL="deepseek-v4-pro" ;;
-  glm)      MODEL="glm-5.1" ;;
   kimi)     MODEL="kimi" ;;
+  minimax)  MODEL="minimax" ;;
+  glm)      MODEL="glm" ;;
   *)
     echo "未知模型: $1"
-    echo "可用: dp_flash, dp_pro, glm, kimi"
+    echo "可用: dp_flash, dp_pro, kimi, minimax, glm"
     echo "查看帮助: ./scripts/all_in_one.sh -help"
     exit 1
     ;;
