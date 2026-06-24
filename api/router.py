@@ -182,6 +182,24 @@ class AnthropicRequest(BaseModel):
     model_config = {"extra": "allow"}
 
 
+class ResponsesInputItem(BaseModel):
+    role: str = "user"
+    content: Optional[Union[str, List[Dict]]] = None
+    type: Optional[str] = None
+    model_config = {"extra": "allow"}
+
+
+class ResponsesRequest(BaseModel):
+    model: str
+    input: Union[str, List[ResponsesInputItem], List[Dict]]
+    instructions: Optional[Union[str, List[Dict]]] = None
+    max_output_tokens: Optional[int] = 4096
+    temperature: Optional[float] = 0.7
+    top_p: Optional[float] = 1.0
+    stream: Optional[bool] = False
+    model_config = {"extra": "allow"}
+
+
 # ------------------------------------------------------------------
 # 页面路由
 # ------------------------------------------------------------------
@@ -414,6 +432,92 @@ async def chat_completions(request: ChatCompletionRequest, state: AppState = Dep
         raise HTTPException(status_code=500, detail=f"内部错误: {str(e)}")
 
 
+@router.post("/v1/responses", tags=["OpenAI兼容"])
+async def create_response(request: ResponsesRequest, state: AppState = Depends(get_app_state)):
+    model = request.model
+
+    if state.model_manager and not state.model_manager.is_model_enabled(model):
+        raise HTTPException(status_code=400, detail=f"模型 '{model}' 未启用或不存")
+
+    messages = []
+    if request.instructions:
+        if isinstance(request.instructions, str):
+            messages.append({"role": "system", "content": request.instructions})
+        elif isinstance(request.instructions, list):
+            texts = [b.get("text", "") if isinstance(b, dict) else str(b) for b in request.instructions]
+            messages.append({"role": "system", "content": "\n".join(texts)})
+
+    if isinstance(request.input, str):
+        messages.append({"role": "user", "content": request.input})
+    elif isinstance(request.input, list):
+        for item in request.input:
+            if isinstance(item, dict):
+                role = item.get("role", "user")
+                content = item.get("content", "")
+                if isinstance(content, list):
+                    text_parts = [b.get("text", "") if isinstance(b, dict) else str(b) for b in content]
+                    messages.append({"role": role, "content": "\n".join(text_parts)})
+                else:
+                    messages.append({"role": role, "content": str(content) if content is not None else ""})
+
+    logger.info(f"[Responses] POST /v1/responses | model={model} | stream={request.stream}")
+
+    try:
+        if request.stream:
+            async def responses_stream():
+                async for chunk in state.proxy.chat_completion_stream(
+                    messages=messages, model=model,
+                    temperature=request.temperature or 0.7,
+                    max_tokens=request.max_output_tokens or 4096,
+                    top_p=request.top_p or 1.0,
+                    extra_params={},
+                ):
+                    yield chunk
+
+            return StreamingResponse(
+                responses_stream(),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+            )
+        else:
+            response = await state.proxy.chat_completion(
+                messages=messages, model=model,
+                temperature=request.temperature or 0.7,
+                max_tokens=request.max_output_tokens or 4096,
+                top_p=request.top_p or 1.0,
+                extra_params={},
+            )
+            raw = response.model_dump()
+            choices = raw.get("choices", [])
+            output_text = ""
+            if choices and choices[0].get("message", {}).get("content"):
+                output_text = choices[0]["message"]["content"]
+            wrapped = {
+                "id": f"resp_{raw.get('id', '').replace('chatcmpl-', '')}",
+                "object": "response",
+                "created": raw.get("created", int(time.time())),
+                "model": model,
+                "output": [{
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": output_text}],
+                }],
+                "usage": {
+                    "input_tokens": raw.get("usage", {}).get("prompt_tokens", 0),
+                    "output_tokens": raw.get("usage", {}).get("completion_tokens", 0),
+                },
+            }
+            return JSONResponse(content=wrapped)
+
+    except AdmissionRejectedException as e:
+        raise HTTPException(status_code=429, detail=e.info, headers={"Retry-After": "5"})
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except Exception as e:
+        logger.error(f"[Responses] 处理请求时发生错误: {e}")
+        raise HTTPException(status_code=500, detail=f"内部错误: {str(e)}")
+
+
 # ------------------------------------------------------------------
 # Anthropic 兼容接口
 # ------------------------------------------------------------------
@@ -625,6 +729,6 @@ async def v1_catch_all(path: str, request: Request):
         f"这可能是客户端（如 opencode）请求了代理未实现的 Anthropic API 端点"
     )
     err = anthropic_adapter.convert_error(
-        404, f"端点 /v1/{path} 未实现。已实现的端点: /v1/messages, /v1/messages/count_tokens, /v1/models"
+        404, f"端点 /v1/{path} 未实现。已实现的端点: /v1/chat/completions, /v1/responses, /v1/messages, /v1/messages/count_tokens, /v1/models"
     )
     raise HTTPException(status_code=404, detail=err)

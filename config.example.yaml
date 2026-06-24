@@ -7,19 +7,31 @@ keys:
 
 nvidia:
   base_url: "https://integrate.api.nvidia.com/v1"
-  default_model: "meta/llama-3.1-70b-instruct"
-  rpm_limit: 40
-  rpm_buffer: 5
+  default_model: "deepseek-ai/deepseek-v4-flash"
+  rpm_limit: 30
+  rpm_buffer: 3
 
 balancer:
   strategy: "most_remaining"
   wait_timeout: 65
-  max_retries: 3
-  admission_mode: "reject_fast"
+  max_retries: 1
+  admission_mode: "queue_wait"
   queue_wait_timeout: 30
 
+  # ★ 模型级故障转移（Model Fallback）
+  # 当主模型被 NVIDIA 429 限流时，自动切换到备选模型重试
+  # 仅 RateLimitError (429) 时触发，非 429 错误不会降级
+  model_fallback:
+    enabled: true
+    models:
+      - "deepseek-ai/deepseek-v4-flash"
+      - "moonshotai/kimi-k2.6"
+      - "minimaxai/minimax-m2.7"
+      - "z-ai/glm-5.1"
+      - "deepseek-ai/deepseek-v4-pro"
+
 server:
-  port: 8000
+  port: 8082
 
 logging:
   level: "INFO"
@@ -29,26 +41,29 @@ logging:
 models:
   auto_fetch: true
   fallback_list:
-    - "meta/llama-3.1-70b-instruct"
-    - "meta/llama-3.1-405b-instruct"
-    - "meta/llama-3.1-8b-instruct"
-    - "nvidia/llama-3.1-nemotron-70b-instruct"
+    - "deepseek-ai/deepseek-v4-flash"
+    - "moonshotai/kimi-k2.6"
+    - "minimaxai/minimax-m2.7"
+    - "z-ai/glm-5.1"
+    - "deepseek-ai/deepseek-v4-pro"
 
 anthropic:
-  default_model: "claude-haiku-4-5-20251001"
+  default_model: "deepseek-v4-flash"
   model_mapping:
-    "claude-opus-4-7": "moonshotai/kimi-k2.5"
-    "claude-opus-4-6": "moonshotai/kimi-k2.5"
-    "claude-sonnet-4-6": "qwen/qwen3.5-397b-a17b"
-    "claude-haiku-4-5-20251001": "moonshotai/kimi-k2-instruct-0905"
+    "deepseek-v4-flash": "deepseek-ai/deepseek-v4-flash"
+    "deepseek-v4-pro": "deepseek-ai/deepseek-v4-pro"
+    "kimi": "moonshotai/kimi-k2.6"
+    "minimax": "minimaxai/minimax-m2.7"
+    "glm": "z-ai/glm-5.1"
   context_windows:
-    "claude-opus-4-7": 1000000
-    "claude-opus-4-6": 1000000
-    "claude-sonnet-4-6": 256000
-    "claude-haiku-4-5-20251001": 200000
+    "deepseek-v4-flash": 1000000
+    "deepseek-v4-pro": 1000000
+    "kimi": 262000
+    "minimax": 200000
+    "glm": 200000
   default_context_window: 200000
   truncation_strategy: "recent"
   truncation_buffer_ratio: 0.10
   enable_thinking: true
   default_thinking_budget: 1024
-  enable_tool_choice: true  
+  enable_tool_choice: true
